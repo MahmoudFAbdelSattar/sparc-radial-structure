@@ -19,3 +19,23 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Additional notice concerning third-party data:
+
+The SPARC catalogue (Spitzer Photometry and Accurate Rotation Curves) used
+by this software is publicly available and is subject to the terms of its
+original publication:
+
+    Lelli, F., McGaugh, S. S., & Schombert, J. M. 2016, AJ, 152, 157
+    https://astroweb.cwru.edu/SPARC/
+
+This software does not redistribute the SPARC catalogue; it downloads the
+catalogue at runtime from its official source. Users of this software are
+responsible for complying with any terms of use that the SPARC collaboration
+may apply to the catalogue data.
+
+If you use this software or the results it produces in scientific work,
+please cite both the software (see CITATION.cff or the README) and the
+SPARC catalogue paper above.
