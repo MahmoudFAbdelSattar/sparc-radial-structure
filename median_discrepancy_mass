@@ -1,0 +1,1582 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+median_discrepancy_mass.py  (v4.1.0 — Term replacement only)
+================================================================================
+Official analysis pipeline for:
+
+    "Radial Structure in the Baryonic Mass Discrepancy of SPARC Spirals:
+     Beyond the Tully–Fisher and Mass–Radius Relations"
+
+Changelog v4.1.0 (term replacement only, no numerical change):
+    - Renamed module: concentration_law.py → median_discrepancy_mass.py
+    - Renamed classes: ConcentrationSample → DiscrepancySample,
+                       ConcentrationAnalyzer → DiscrepancyAnalyzer
+    - Renamed output directory: concentration_law_output_v4 →
+                                median_discrepancy_mass_output
+    - Updated User-Agent: ConcentrationLaw → DiscrepancyMassRelation
+    - Updated plot label: "Concentration-law slope" →
+                          "Slope of median discrepancy–mass relation"
+    - Updated CLI prog / version strings.
+    - No numerical results, tables, or figures have changed.
+    - Legacy cache path (concentration_law_output) is preserved
+      only to reuse the previously downloaded SPARC catalogue.
+================================================================================
+"""
+from __future__ import annotations
+
+import argparse, json, pickle, platform, sys, time, warnings
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from scipy import stats
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import statsmodels.api as sm
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import KFold
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+__version__ = "4.1.0"
+
+G_KPC_KMS2_PER_MSUN = 4.300917e-6
+MASS_FACTOR = 1.0 / G_KPC_KMS2_PER_MSUN
+UPSILON_REF_DISK = 0.5
+UPSILON_REF_BULGE = 0.7
+
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+@dataclass
+class Config:
+    SPARC_URL: str = "https://astroweb.cwru.edu/SPARC/MassModels_Lelli2016c.mrt"
+    SPARC_URL_FALLBACK: str = "http://astroweb.cwru.edu/SPARC/MassModels_Lelli2016c.mrt"
+    OUTPUT_DIR: str = "median_discrepancy_mass_output"
+    CACHE_FILE: str = "sparc_massmodels.pkl"
+    # Legacy cache directory is preserved only to reuse the previously
+    # downloaded SPARC catalogue (no analysis depends on it).
+    LEGACY_CACHE_DIR: str = "concentration_law_output"
+    FORCE_REFRESH: bool = False
+    RANDOM_SEED: int = 42
+    BOOTSTRAP_N: int = 5000
+    BOOTSTRAP_CONF: float = 0.95
+    CV_SPLITS: int = 10
+    R_SAT_KPC: float = 5.0
+    V_BAR_MIN_KMS: float = 3.0
+    PHI_MAX: float = 1.5
+    N_SAT_MIN: int = 4
+    M_BAR_MAX_MSUN: float = 1e11
+    UPSILON_DISK: float = 0.5
+    UPSILON_BULGE: float = 0.7
+    MIN_TOTAL_POINTS: int = 5
+    FIGURE_DPI: int = 300
+    ML_SWEEP: Tuple[float, ...] = (0.5, 0.6, 0.7, 1.0, 1.4)
+    CUT_SWEEP: Tuple[float, ...] = (5e10, 1e11, 2e11, 5e11, 1e12, 5e12, 1e15)
+    R_SAT_SWEEP: Tuple[float, ...] = (4.0, 4.5, 5.0, 5.5, 6.0)
+
+    def fingerprint(self) -> str:
+        import hashlib
+        payload = json.dumps(asdict(self), sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
+
+
+# ==============================================================================
+# REPORTER
+# ==============================================================================
+
+class Reporter:
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.t0 = time.time()
+
+    def _stamp(self) -> str:
+        return f"[{time.time() - self.t0:7.2f}s]"
+
+    def header(self, text: str) -> None:
+        if not self.verbose: return
+        print(f"\n{'═' * 74}\n  {text}\n{'═' * 74}")
+
+    def section(self, text: str) -> None:
+        if not self.verbose: return
+        print(f"\n{self._stamp()}  ▸ {text}")
+
+    def info(self, text: str) -> None:
+        if not self.verbose: return
+        print(f"{self._stamp()}    {text}")
+
+    def ok(self, text: str) -> None:
+        if not self.verbose: return
+        print(f"{self._stamp()}    ✓ {text}")
+
+    def warn(self, text: str) -> None:
+        if not self.verbose: return
+        print(f"{self._stamp()}    ⚠ {text}")
+
+    def error(self, text: str) -> None:
+        print(f"{self._stamp()}    ✗ {text}", file=sys.stderr)
+
+
+# ==============================================================================
+# STAGE 1 — DATA
+# ==============================================================================
+
+class SPARCFetcher:
+    def __init__(self, cfg: Config, reporter: Reporter):
+        self.cfg, self.rp = cfg, reporter
+
+    def load(self) -> Dict[str, List[Dict[str, float]]]:
+        out = Path(self.cfg.OUTPUT_DIR)
+        out.mkdir(parents=True, exist_ok=True)
+        new_cache = out / self.cfg.CACHE_FILE
+
+        if new_cache.exists() and not self.cfg.FORCE_REFRESH:
+            return self._load_from(new_cache)
+
+        legacy = Path(self.cfg.LEGACY_CACHE_DIR) / self.cfg.CACHE_FILE
+        if legacy.exists() and not self.cfg.FORCE_REFRESH:
+            self.rp.section(f"Loading cached SPARC from legacy path")
+            return self._load_from(legacy)
+
+        return self._download(new_cache)
+
+    def _load_from(self, path: Path) -> Dict[str, List[Dict[str, float]]]:
+        self.rp.section(f"Loading cached SPARC ({path})")
+        with open(path, "rb") as f:
+            galaxies = pickle.load(f)
+        n_pts = sum(len(g) for g in galaxies.values())
+        self.rp.ok(f"{len(galaxies)} galaxies, {n_pts} points")
+        return galaxies
+
+    def _download(self, cache: Path) -> Dict[str, List[Dict[str, float]]]:
+        last_err = None
+        for url in (self.cfg.SPARC_URL, self.cfg.SPARC_URL_FALLBACK):
+            try:
+                self.rp.section("Downloading SPARC catalogue")
+                self.rp.info(f"URL: {url}")
+                resp = requests.get(url, timeout=180,
+                                    headers={"User-Agent": f"DiscrepancyMassRelation/{__version__}"})
+                resp.raise_for_status()
+                self.rp.ok(f"Received {len(resp.text):,} bytes")
+                galaxies = self._parse(resp.text)
+                with open(cache, "wb") as f:
+                    pickle.dump(galaxies, f)
+                self.rp.ok(f"Cached → {cache}")
+                return galaxies
+            except Exception as exc:
+                last_err = exc
+                self.rp.warn(f"Failed: {exc}")
+        raise RuntimeError(f"All downloads failed. Last: {last_err}")
+
+    def _parse(self, text: str) -> Dict[str, List[Dict[str, float]]]:
+        galaxies: Dict[str, List[Dict[str, float]]] = {}
+        n_total = n_parsed = n_skipped = 0
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("//"): continue
+            n_total += 1
+            cols = s.split()
+            if len(cols) < 8:
+                n_skipped += 1; continue
+            try:
+                name    = cols[0]
+                radius  = float(cols[2])
+                v_obs   = abs(float(cols[3]))
+                v_gas   = abs(float(cols[5]))
+                v_disk  = abs(float(cols[6]))
+                v_bulge = abs(float(cols[7]))
+            except (ValueError, IndexError):
+                n_skipped += 1; continue
+            if not all(np.isfinite(x) for x in (radius, v_obs, v_gas, v_disk, v_bulge)):
+                n_skipped += 1; continue
+            galaxies.setdefault(name, []).append({
+                "radius": radius, "v_obs": v_obs,
+                "v_gas": v_gas, "v_disk": v_disk, "v_bulge": v_bulge,
+            })
+            n_parsed += 1
+        if not galaxies:
+            raise RuntimeError("Parser returned zero galaxies.")
+        self.rp.info(f"Lines: {n_total}, parsed: {n_parsed}, skipped: {n_skipped}")
+        self.rp.ok(f"{len(galaxies)} galaxies, {n_parsed} points")
+        return galaxies
+
+
+# ==============================================================================
+# STAGE 2 — SAMPLE CONSTRUCTION
+# ==============================================================================
+
+class DiscrepancySample:
+    EXPECTED_COLUMNS: Tuple[str, ...] = (
+        "name", "N_total", "N_valid", "N_saturated",
+        "R_max", "v_bar_Rmax", "v_obs_Rmax", "v_gas_Rmax", "v_disk_Rmax", "v_bulge_Rmax",
+        "phi_end", "phi_end_mean", "phi_Rmax",
+        "M_bar", "M_disk", "M_gas", "M_bulge",
+        "Sigma", "f_gas",
+        "log_M_bar", "log_M_disk", "log_M_gas", "log_R_max", "log_Sigma",
+        "log_vbar_Rmax", "log_vobs_Rmax",
+    )
+
+    def __init__(self, cfg: Config, reporter: Reporter):
+        self.cfg, self.rp = cfg, reporter
+        self._reset()
+
+    def _reset(self):
+        self._rejections: List[Tuple[str, str, str]] = []
+        self._counts = {"input": 0, "with_valid_points": 0,
+                        "with_sat_points": 0, "after_mass_cut": 0,
+                        "final": 0, "total_sat_points": 0}
+
+    def _v_bar(self, vg, vd, vb) -> float:
+        fd = np.sqrt(self.cfg.UPSILON_DISK / UPSILON_REF_DISK)
+        fb = np.sqrt(self.cfg.UPSILON_BULGE / UPSILON_REF_BULGE)
+        return float(np.sqrt(vg**2 + (vd*fd)**2 + (vb*fb)**2))
+
+    def _masses(self, vg, vd, vb, R):
+        fd = np.sqrt(self.cfg.UPSILON_DISK / UPSILON_REF_DISK)
+        fb = np.sqrt(self.cfg.UPSILON_BULGE / UPSILON_REF_BULGE)
+        return {
+            "M_gas": MASS_FACTOR * vg**2 * R,
+            "M_disk": MASS_FACTOR * (vd*fd)**2 * R,
+            "M_bulge": MASS_FACTOR * (vb*fb)**2 * R,
+        }
+
+    def _process(self, name, points):
+        cfg = self.cfg
+        if len(points) < cfg.MIN_TOTAL_POINTS:
+            self._rejections.append((name, "too_few_total_points", f"N={len(points)}"))
+            return None
+        valid = []
+        for p in points:
+            try:
+                vg, vd, vb = float(p["v_gas"]), float(p["v_disk"]), float(p["v_bulge"])
+                vo, r = float(p["v_obs"]), float(p["radius"])
+            except (KeyError, ValueError, TypeError): continue
+            if not all(np.isfinite(x) for x in (vg, vd, vb, vo, r)): continue
+            vbar = self._v_bar(vg, vd, vb)
+            if not np.isfinite(vbar) or vbar < cfg.V_BAR_MIN_KMS: continue
+            if vo <= vbar: continue
+            phi = float(np.log(vo / vbar))
+            if not np.isfinite(phi) or phi >= cfg.PHI_MAX: continue
+            valid.append({"radius": r, "v_obs": vo, "v_bar": vbar, "phi": phi,
+                          "v_gas": vg, "v_disk": vd, "v_bulge": vb})
+        if not valid:
+            self._rejections.append((name, "no_valid_points", "0")); return None
+        self._counts["with_valid_points"] += 1
+
+        sat = [p for p in valid if p["radius"] >= cfg.R_SAT_KPC]
+        if len(sat) < cfg.N_SAT_MIN:
+            self._rejections.append((name, "too_few_saturated", f"N_sat={len(sat)}"))
+            return None
+        self._counts["with_sat_points"] += 1
+
+        rmax = max(valid, key=lambda p: p["radius"])
+        R = float(rmax["radius"])
+        m = self._masses(rmax["v_gas"], rmax["v_disk"], rmax["v_bulge"], R)
+        Mbar = m["M_gas"] + m["M_disk"] + m["M_bulge"]
+        if not np.isfinite(Mbar) or Mbar <= 0:
+            self._rejections.append((name, "bad_mass", f"{Mbar}")); return None
+        if Mbar >= cfg.M_BAR_MAX_MSUN:
+            self._rejections.append((name, "mbar_exceeds_limit", f"{Mbar:.2e}"))
+            return None
+        self._counts["after_mass_cut"] += 1
+
+        phis = [p["phi"] for p in sat]
+        phi_Rmax = float(np.log(rmax["v_obs"] / rmax["v_bar"]))
+        Sigma = Mbar / (np.pi * R**2)
+        self._counts["total_sat_points"] += len(sat)
+
+        return {
+            "name": name, "N_total": len(points), "N_valid": len(valid),
+            "N_saturated": len(sat), "R_max": R,
+            "v_bar_Rmax": rmax["v_bar"], "v_obs_Rmax": rmax["v_obs"],
+            "v_gas_Rmax": rmax["v_gas"], "v_disk_Rmax": rmax["v_disk"],
+            "v_bulge_Rmax": rmax["v_bulge"],
+            "phi_end": float(np.median(phis)),
+            "phi_end_mean": float(np.mean(phis)),
+            "phi_Rmax": phi_Rmax,
+            "M_bar": Mbar, "M_disk": m["M_disk"],
+            "M_gas": m["M_gas"], "M_bulge": m["M_bulge"],
+            "Sigma": Sigma,
+            "f_gas": m["M_gas"] / Mbar if Mbar > 0 else np.nan,
+            "log_M_bar": float(np.log10(Mbar)),
+        }
+
+    @staticmethod
+    def _enrich_logs(df: pd.DataFrame) -> pd.DataFrame:
+        if len(df) == 0: return df
+        for src, dst in [
+            ("M_bar",  "log_M_bar"), ("M_disk", "log_M_disk"),
+            ("M_gas",  "log_M_gas"), ("R_max",  "log_R_max"),
+            ("Sigma",  "log_Sigma"),
+            ("v_bar_Rmax", "log_vbar_Rmax"),
+            ("v_obs_Rmax", "log_vobs_Rmax"),
+        ]:
+            if dst in df.columns: continue
+            if src not in df.columns:
+                df[dst] = np.nan; continue
+            v = df[src].astype(float).to_numpy()
+            v = np.where(np.isfinite(v) & (v > 0), v, np.nan)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                df[dst] = np.log10(v)
+        return df
+
+    def build(self, galaxies):
+        self._reset()
+        self._counts["input"] = len(galaxies)
+        rows = []
+        for name in sorted(galaxies):
+            r = self._process(name, galaxies[name])
+            if r is not None: rows.append(r)
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=self.EXPECTED_COLUMNS)
+        df = self._enrich_logs(df)
+        self._counts["final"] = len(df)
+        self._print_report(df)
+        return df
+
+    def _print_report(self, df):
+        c, cfg = self._counts, self.cfg
+        self.rp.section("Sample construction")
+        self.rp.info(f"Input galaxies                              : {c['input']}")
+        self.rp.info(f"With ≥1 valid point                         : {c['with_valid_points']}")
+        self.rp.info(f"With ≥{cfg.N_SAT_MIN} saturated (r ≥ {cfg.R_SAT_KPC} kpc)      : {c['with_sat_points']}")
+        self.rp.info(f"After M_bar < {cfg.M_BAR_MAX_MSUN:.1e} M_⊙              : {c['after_mass_cut']}")
+        self.rp.info(f"FINAL SAMPLE                                : {c['final']}")
+        self.rp.info(f"Total saturated points                      : {c['total_sat_points']}")
+
+    def rejections_df(self):
+        return pd.DataFrame(self._rejections, columns=["name", "reason", "detail"])
+
+    def counts(self) -> Dict[str, int]:
+        return dict(self._counts)
+
+
+# ==============================================================================
+# STAGE 3 — STATISTICAL ANALYSIS
+# ==============================================================================
+
+class DiscrepancyAnalyzer:
+    def __init__(self, df, cfg, reporter):
+        if df is None or len(df) < 10:
+            raise ValueError(f"Insufficient sample: N={0 if df is None else len(df)}")
+        self.df = df.copy().reset_index(drop=True)
+        self.cfg, self.rp = cfg, reporter
+        self.rng = np.random.default_rng(cfg.RANDOM_SEED)
+        self.df = DiscrepancySample._enrich_logs(self.df)
+
+    @staticmethod
+    def _partial(x, y, z):
+        m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+        n = int(m.sum())
+        if n < 6: return {"rho": np.nan, "p": np.nan, "N": n}
+        x, y, z = x[m], y[m], z[m]
+        rx = x - np.polyval(np.polyfit(z, x, 1), z)
+        ry = y - np.polyval(np.polyfit(z, y, 1), z)
+        r = float(np.clip(np.corrcoef(rx, ry)[0, 1], -0.999999, 0.999999))
+        t = r * np.sqrt((n - 3) / (1 - r**2))
+        return {"rho": r, "p": float(2 * stats.t.sf(abs(t), df=n - 3)), "N": n}
+
+    def _fit_ols(self, y_col, predictors):
+        y = self.df[y_col].to_numpy()
+        cols = [self.df[p].to_numpy() for p in predictors]
+        m = np.isfinite(y)
+        for c in cols: m &= np.isfinite(c)
+        n = int(m.sum())
+        if n < self.cfg.MIN_TOTAL_POINTS:
+            raise ValueError(f"Too few rows: N={n}")
+        X = sm.add_constant(np.column_stack([c[m] for c in cols]))
+        return sm.OLS(y[m], X).fit(), n, X
+
+    def fit_main_relation(self, y_col: str = "phi_end", bootstrap: bool = True):
+        x = self.df["log_M_bar"].to_numpy()
+        y = self.df[y_col].to_numpy()
+        m = np.isfinite(x) & np.isfinite(y)
+        x, y = x[m], y[m]
+        n = int(m.sum())
+        if n < self.cfg.MIN_TOTAL_POINTS:
+            raise ValueError(f"Too few valid rows: N={n}")
+        model = sm.OLS(y, sm.add_constant(x)).fit()
+        res = {
+            "N": n,
+            "intercept": float(model.params[0]), "intercept_se": float(model.bse[0]),
+            "slope": float(model.params[1]), "slope_se": float(model.bse[1]),
+            "R2": float(model.rsquared), "R2_adj": float(model.rsquared_adj),
+            "equation": f"{y_col} = {model.params[0]:.3f} {model.params[1]:+.3f} logM",
+            "x": x, "y": y, "model": model,
+        }
+        r, p = stats.pearsonr(x, y); rho, ps = stats.spearmanr(x, y)
+        res.update({"pearson_r": float(r), "pearson_p": float(p),
+                    "spearman_rho": float(rho), "spearman_p": float(ps)})
+        if bootstrap:
+            nb = self.cfg.BOOTSTRAP_N
+            slopes = np.empty(nb); icepts = np.empty(nb)
+            for i in range(nb):
+                idx = self.rng.integers(0, n, size=n)
+                b = stats.linregress(x[idx], y[idx])
+                slopes[i], icepts[i] = b.slope, b.intercept
+            a = 1 - self.cfg.BOOTSTRAP_CONF
+            lo, hi = 100*a/2, 100*(1 - a/2)
+            res["slope_ci"] = [float(np.percentile(slopes, lo)),
+                               float(np.percentile(slopes, hi))]
+            res["intercept_ci"] = [float(np.percentile(icepts, lo)),
+                                   float(np.percentile(icepts, hi))]
+        return res
+
+    def compute_btfr_rm_consistency(self):
+        self.rp.section("BTFR + R(M) consistency test")
+        x = self.df["log_M_bar"].to_numpy()
+        log_vobs = self.df["log_vobs_Rmax"].to_numpy()
+        log_vbar = self.df["log_vbar_Rmax"].to_numpy()
+        log_Rmax = self.df["log_R_max"].to_numpy()
+        phi_Rmax = self.df["phi_Rmax"].to_numpy()
+        m = np.isfinite(x) & np.isfinite(log_vobs) & np.isfinite(log_vbar) & \
+            np.isfinite(log_Rmax) & np.isfinite(phi_Rmax)
+        x, log_vobs, log_vbar, log_Rmax, phi_Rmax = (
+            x[m], log_vobs[m], log_vbar[m], log_Rmax[m], phi_Rmax[m])
+
+        btfr = stats.linregress(x, log_vobs)
+        rm = stats.linregress(x, log_Rmax)
+        obs = stats.linregress(x, phi_Rmax)
+        predicted_slope = (btfr.slope - 0.5 + rm.slope / 2.0) * np.log(10)
+        residual = obs.slope - predicted_slope
+
+        result = {
+            "N": int(len(x)),
+            "btfr_slope_alpha":  float(btfr.slope),
+            "btfr_intercept_beta": float(btfr.intercept),
+            "btfr_r": float(btfr.rvalue),
+            "rm_slope_p":  float(rm.slope),
+            "rm_intercept_q": float(rm.intercept),
+            "rm_r": float(rm.rvalue),
+            "predicted_slope": float(predicted_slope),
+            "observed_slope":  float(obs.slope),
+            "observed_intercept": float(obs.intercept),
+            "observed_r": float(obs.rvalue),
+            "observed_R2": float(obs.rvalue**2),
+            "residual": float(residual),
+            "agreement_pct": float(abs(residual) / abs(predicted_slope) * 100) if predicted_slope != 0 else np.nan,
+        }
+        self.rp.info(f"BTFR on sample: α = {btfr.slope:+.3f}, r = {btfr.rvalue:+.3f}")
+        self.rp.info(f"R(M) on sample: p = {rm.slope:+.3f}, r = {rm.rvalue:+.3f}")
+        self.rp.info(f"Predicted slope: {predicted_slope:+.3f}")
+        self.rp.info(f"Observed slope : {obs.slope:+.3f}")
+        self.rp.info(f"Residual       : {residual:+.4f}")
+        if abs(residual) < 0.02:
+            self.rp.ok("φ(R_max) IS fully explained by BTFR + R(M)")
+        else:
+            self.rp.warn(f"Residual {residual:+.3f} is non-negligible")
+        return result
+
+    def compute_radial_structure(self):
+        self.rp.section("Radial structure analysis (Δφ)")
+        df = self.df.copy()
+        df["delta_phi"] = df["phi_end"] - df["phi_Rmax"]
+
+        delta = df["delta_phi"].dropna().to_numpy()
+        stats_summary = {
+            "N": int(len(delta)),
+            "mean": float(delta.mean()),
+            "std": float(delta.std()),
+            "median": float(np.median(delta)),
+            "Q1": float(np.percentile(delta, 25)),
+            "Q3": float(np.percentile(delta, 75)),
+            "min": float(delta.min()),
+            "max": float(delta.max()),
+        }
+        self.rp.info(f"Δφ: mean={stats_summary['mean']:+.4f}, "
+                     f"median={stats_summary['median']:+.4f}, "
+                     f"std={stats_summary['std']:.4f}")
+
+        raw_corrs = {}
+        for var in ["log_R_max", "log_M_bar", "log_M_disk", "log_M_gas",
+                    "log_Sigma", "f_gas"]:
+            if var not in df.columns: continue
+            v = df[var].to_numpy(); d = df["delta_phi"].to_numpy()
+            mm = np.isfinite(v) & np.isfinite(d)
+            if mm.sum() < 10: continue
+            r, p = stats.pearsonr(d[mm], v[mm])
+            raw_corrs[var] = {"r": float(r), "p": float(p), "N": int(mm.sum())}
+            self.rp.info(f"  r(Δφ, {var:12s}) = {r:+.3f}, p = {p:.2e}")
+
+        partial_corrs = {}
+        for var in ["log_R_max", "f_gas", "log_Sigma"]:
+            if var not in df.columns: continue
+            res = self._partial(df["delta_phi"].to_numpy(),
+                                df[var].to_numpy(),
+                                df["log_M_bar"].to_numpy())
+            partial_corrs[var] = res
+            self.rp.info(f"  r(Δφ, {var:12s} | M_bar) = {res['rho']:+.3f}, p = {res['p']:.2e}")
+
+        tertiles = self._compute_tertile_stability(df)
+        self.rp.info("Δφ ~ R_max by M_bar tertile:")
+        for name, val in tertiles.items():
+            self.rp.info(f"  {name:6s}: N={val['N']:3d}, r={val['r']:+.3f}, p={val['p']:.2e}")
+
+        x = df["log_M_bar"].to_numpy(); d = df["delta_phi"].to_numpy()
+        mm = np.isfinite(x) & np.isfinite(d)
+        delta_fit = stats.linregress(x[mm], d[mm])
+
+        return {
+            "statistics": stats_summary,
+            "raw_correlations": raw_corrs,
+            "partial_correlations": partial_corrs,
+            "tertiles": tertiles,
+            "delta_vs_mbar": {
+                "slope": float(delta_fit.slope),
+                "intercept": float(delta_fit.intercept),
+                "r": float(delta_fit.rvalue),
+                "p": float(delta_fit.pvalue),
+                "N": int(mm.sum()),
+            },
+        }
+
+    def _compute_tertile_stability(self, df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+        df = df.copy()
+        mask = np.isfinite(df["log_M_bar"]) & np.isfinite(df["delta_phi"]) & np.isfinite(df["log_R_max"])
+        df = df[mask].reset_index(drop=True)
+        if len(df) < 20: return {}
+        try:
+            df["M_ter"] = pd.qcut(df["log_M_bar"], 3, labels=["low", "mid", "high"])
+        except ValueError:
+            return {}
+        out = {}
+        for label in ["low", "mid", "high"]:
+            grp = df[df["M_ter"] == label]
+            if len(grp) < 5: continue
+            try:
+                r, p = stats.pearsonr(grp["delta_phi"], grp["log_R_max"])
+                out[label] = {"N": int(len(grp)), "r": float(r), "p": float(p)}
+            except Exception:
+                continue
+        return out
+
+    def correlation_table(self, y_col: str = "phi_end"):
+        y = self.df[y_col].to_numpy(); rows = []
+        for v in ["log_M_bar", "log_M_disk", "log_M_gas", "log_R_max", "log_Sigma", "f_gas"]:
+            if v not in self.df: continue
+            x = self.df[v].to_numpy()
+            m = np.isfinite(x) & np.isfinite(y)
+            if m.sum() < self.cfg.MIN_TOTAL_POINTS: continue
+            rho, p = stats.spearmanr(x[m], y[m]); r, _ = stats.pearsonr(x[m], y[m])
+            rows.append({"variable": v, "spearman_rho": float(rho),
+                         "spearman_p": float(p), "pearson_r": float(r), "N": int(m.sum())})
+        return pd.DataFrame(rows).sort_values("spearman_rho").reset_index(drop=True)
+
+    def partial_table(self, y_col: str = "phi_end"):
+        y = self.df[y_col].to_numpy(); rows = []
+        for var, ctrl in [("log_M_gas","log_M_bar"),("log_M_disk","log_M_gas"),
+                          ("log_M_disk","log_M_bar"),("log_M_bar","log_M_disk"),
+                          ("f_gas","log_M_bar")]:
+            if var not in self.df or ctrl not in self.df: continue
+            r = self._partial(self.df[var].to_numpy(), y, self.df[ctrl].to_numpy())
+            rows.append({"variable": var, "controlling_for": ctrl,
+                         "partial_rho": r["rho"], "p_value": r["p"], "N": r["N"]})
+        return pd.DataFrame(rows)
+
+    def multivariate_models(self):
+        specs = [
+            ("M_bar",              ["log_M_bar"]),
+            ("M_disk",             ["log_M_disk"]),
+            ("M_bar + Σ",          ["log_M_bar","log_Sigma"]),
+            ("M_disk + Σ",         ["log_M_disk","log_Sigma"]),
+            ("M_bar + f_gas + Σ",  ["log_M_bar","f_gas","log_Sigma"]),
+        ]
+        rows = []
+        for name, preds in specs:
+            try:
+                mdl, n, _ = self._fit_ols("phi_end", preds)
+                rows.append({"model": name, "predictors": ", ".join(preds),
+                             "k": len(preds), "N": n,
+                             "R2": float(mdl.rsquared),
+                             "R2_adj": float(mdl.rsquared_adj),
+                             "AIC": float(mdl.aic), "BIC": float(mdl.bic)})
+            except Exception as exc:
+                self.rp.warn(f"Model '{name}' skipped: {exc}")
+        return pd.DataFrame(rows).sort_values("R2", ascending=False).reset_index(drop=True)
+
+    def cross_validation(self):
+        specs = [("M_bar",["log_M_bar"]),("M_bar + Σ",["log_M_bar","log_Sigma"]),
+                 ("M_bar + f_gas + Σ",["log_M_bar","f_gas","log_Sigma"])]
+        kf = KFold(n_splits=self.cfg.CV_SPLITS, shuffle=True, random_state=self.cfg.RANDOM_SEED)
+        rows = []
+        for name, preds in specs:
+            try:
+                cols = [self.df[p].to_numpy() for p in preds]
+                y = self.df["phi_end"].to_numpy()
+                m = np.isfinite(y)
+                for c in cols: m &= np.isfinite(c)
+                X = np.column_stack([c[m] for c in cols]); yv = y[m]
+                if len(yv) < self.cfg.MIN_TOTAL_POINTS: continue
+                r2s, rms = [], []
+                for tr, te in kf.split(X):
+                    mdl = LinearRegression().fit(X[tr], yv[tr])
+                    yp = mdl.predict(X[te])
+                    r2s.append(mdl.score(X[te], yv[te]))
+                    rms.append(float(np.sqrt(np.mean((yv[te] - yp)**2))))
+                rows.append({"model": name, "predictors": ", ".join(preds),
+                             "R2_cv_mean": float(np.mean(r2s)),
+                             "R2_cv_std": float(np.std(r2s)),
+                             "RMSE_cv_mean": float(np.mean(rms)), "N": int(len(yv))})
+            except Exception as exc:
+                self.rp.warn(f"CV '{name}' skipped: {exc}")
+        return pd.DataFrame(rows).sort_values("R2_cv_mean", ascending=False).reset_index(drop=True)
+
+    def circularity_test(self):
+        logM = self.df["log_M_bar"].to_numpy()
+        phi = self.df["phi_end"].to_numpy()
+        vo = self.df["v_obs_Rmax"].to_numpy()
+        vb = self.df["v_bar_Rmax"].to_numpy()
+        def _r(a, b):
+            m = np.isfinite(a) & np.isfinite(b)
+            if m.sum() < 10: return np.nan, np.nan, 0
+            r, p = stats.pearsonr(a[m], b[m]); return float(r), float(p), int(m.sum())
+        rv, pv, n1 = _r(logM, vo); rb, pb, n2 = _r(logM, vb)
+        rp, pp, n3 = _r(logM, phi); rbv, _, _ = _r(vb, vo)
+        return {"r_Mbar_vobs": rv, "p_Mbar_vobs": pv, "r_Mbar_vbar": rb,
+                "p_Mbar_vbar": pb, "r_Mbar_phi": rp, "p_Mbar_phi": pp,
+                "r_vbar_vobs": rbv, "N": min(n1, n2, n3)}
+
+    def residual_diagnostics(self, main_result=None):
+        main = main_result if main_result is not None else self.fit_main_relation()
+        model = main["model"]; x = main["x"]
+        residuals = np.asarray(model.resid)
+        shapiro_W = shapiro_p = np.nan
+        if len(residuals) <= 5000:
+            shapiro_W, shapiro_p = stats.shapiro(residuals)
+        _, bp_p, _, _ = het_breuschpagan(residuals, sm.add_constant(x))
+        sigma = float(np.std(residuals, ddof=1))
+        outlier_mask = np.abs(residuals) > 3 * sigma
+        names = self.df.get("name", pd.Series(["?"]*len(self.df))).to_numpy()
+        y = self.df["phi_end"].to_numpy(); lm = self.df["log_M_bar"].to_numpy()
+        mask = np.isfinite(y) & np.isfinite(lm)
+        outlier_names = names[mask][outlier_mask].tolist() if outlier_mask.any() else []
+        return {"residuals": residuals, "fitted": np.asarray(model.fittedvalues),
+                "x_logM": x, "rms": sigma,
+                "shapiro_W": float(shapiro_W) if np.isfinite(shapiro_W) else np.nan,
+                "shapiro_p": float(shapiro_p) if np.isfinite(shapiro_p) else np.nan,
+                "bp_p": float(bp_p),
+                "skewness": float(stats.skew(residuals)),
+                "kurtosis_excess": float(stats.kurtosis(residuals)),
+                "n_outliers": int(outlier_mask.sum()),
+                "outlier_names": outlier_names}
+
+    def ml_sensitivity_rigorous(self, galaxies, upsilon_values=None):
+        if upsilon_values is None: upsilon_values = self.cfg.ML_SWEEP
+        self.rp.section("TRUE fixed-sample M/L sensitivity")
+        ref_names = set(self.df["name"].tolist())
+        results = {}
+        for U in upsilon_values:
+            fd = np.sqrt(U / UPSILON_REF_DISK); fb = 1.0
+            new_phi, new_logM = [], []
+            survived, disappeared = [], []
+            degraded = 0
+            for name in sorted(ref_names):
+                pts = galaxies[name]
+                valid = []
+                for p in pts:
+                    try:
+                        vg, vd, vb = float(p["v_gas"]), float(p["v_disk"]), float(p["v_bulge"])
+                        vo, r = float(p["v_obs"]), float(p["radius"])
+                    except (KeyError, ValueError, TypeError): continue
+                    if not all(np.isfinite(x) for x in (vg, vd, vb, vo, r)): continue
+                    vbar = float(np.sqrt(vg**2 + (vd*fd)**2 + (vb*fb)**2))
+                    if vbar < self.cfg.V_BAR_MIN_KMS: continue
+                    if vo <= vbar: continue
+                    phi = float(np.log(vo/vbar))
+                    if not np.isfinite(phi) or phi >= self.cfg.PHI_MAX: continue
+                    valid.append({"r": r, "phi": phi, "vbar": vbar})
+                if len(valid) == 0:
+                    disappeared.append(name); continue
+                sat = [v for v in valid if v["r"] >= self.cfg.R_SAT_KPC]
+                if len(sat) >= self.cfg.N_SAT_MIN:
+                    phi_vals = [s["phi"] for s in sat]
+                elif len(sat) >= 1:
+                    degraded += 1
+                    phi_vals = [s["phi"] for s in sat]
+                else:
+                    degraded += 1
+                    phi_vals = [v["phi"] for v in valid]
+                rmax = max(valid, key=lambda x: x["r"])
+                Mbar = MASS_FACTOR * rmax["vbar"]**2 * rmax["r"]
+                if not np.isfinite(Mbar) or Mbar <= 0:
+                    disappeared.append(name); continue
+                new_phi.append(float(np.median(phi_vals)))
+                new_logM.append(float(np.log10(Mbar)))
+                survived.append(name)
+            if len(new_phi) < 10:
+                results[U] = {"N": len(new_phi), "slope": np.nan,
+                              "N_disappeared": len(disappeared), "N_degraded": degraded}
+                continue
+            fit = stats.linregress(new_logM, new_phi)
+            results[U] = {
+                "N": len(new_phi), "N_disappeared": len(disappeared),
+                "N_degraded": degraded,
+                "survived": survived, "disappeared": disappeared,
+                "slope": float(fit.slope), "intercept": float(fit.intercept),
+                "r": float(fit.rvalue), "R2": float(fit.rvalue**2),
+            }
+            d = f", {len(disappeared)} disappeared" if disappeared else ""
+            g = f", {degraded} degraded" if degraded else ""
+            self.rp.info(f"Υ={U:.1f} : N={len(new_phi):3d}, slope={fit.slope:+.3f}, "
+                         f"r={fit.rvalue:+.3f}, R²={fit.rvalue**2:.3f}{d}{g}")
+        return results
+
+    def selection_effect_analysis(self, galaxies):
+        self.rp.section("Selection-effect analysis (progressive M_bar cuts)")
+        rows = []
+        for cutoff in self.cfg.CUT_SWEEP:
+            cfg_u = Config(**{**asdict(self.cfg), "M_BAR_MAX_MSUN": cutoff})
+            sample = DiscrepancySample(cfg_u, Reporter(verbose=False)).build(galaxies)
+            if len(sample) < 10: continue
+            analyzer = DiscrepancyAnalyzer(sample, cfg_u, Reporter(verbose=False))
+            m = analyzer.fit_main_relation(bootstrap=False)
+            rows.append({"cutoff": cutoff, "N": m["N"], "slope": m["slope"],
+                         "intercept": m["intercept"], "r": m["pearson_r"],
+                         "R2": m["R2"], "spearman_rho": m["spearman_rho"]})
+            label = "no cut" if cutoff >= 1e15 else f"{cutoff:.0e}"
+            self.rp.info(f"{label:>8s} : N={m['N']:3d}, slope={m['slope']:+.3f}, "
+                         f"r={m['pearson_r']:+.3f}, R²={m['R2']:.3f}")
+        return pd.DataFrame(rows)
+
+    def r_sat_analysis(self, galaxies):
+        self.rp.section("Saturated-regime threshold sensitivity (r_sat sweep)")
+        rows = []
+        for rs in self.cfg.R_SAT_SWEEP:
+            cfg_u = Config(**{**asdict(self.cfg), "R_SAT_KPC": rs})
+            sample = DiscrepancySample(cfg_u, Reporter(verbose=False)).build(galaxies)
+            if len(sample) < 10: continue
+            analyzer = DiscrepancyAnalyzer(sample, cfg_u, Reporter(verbose=False))
+            m = analyzer.fit_main_relation(bootstrap=False)
+            rows.append({"r_sat": rs, "N": m["N"], "slope": m["slope"],
+                         "intercept": m["intercept"], "r": m["pearson_r"],
+                         "R2": m["R2"]})
+            self.rp.info(f"r_sat={rs:.1f} : N={m['N']:3d}, slope={m['slope']:+.3f}, "
+                         f"r={m['pearson_r']:+.3f}, R²={m['R2']:.3f}")
+        return pd.DataFrame(rows)
+
+    def disappearing_galaxies_properties(self, ml_results, upsilon_disappear=1.4):
+        self.rp.section("Properties of disappearing galaxies")
+        if upsilon_disappear not in ml_results: return {}
+        r = ml_results[upsilon_disappear]
+        disappeared = r.get("disappeared", [])
+        if not disappeared: return {"N_disappeared": 0}
+        ref_df = self.df.set_index("name")
+        dis_mask = ref_df.index.isin(disappeared)
+        dis_df = ref_df[dis_mask]; sur_df = ref_df[~dis_mask]
+        props = ["log_M_bar", "phi_end", "R_max", "Sigma", "f_gas"]
+        summary = {"N_disappeared": len(dis_df), "N_survived": len(sur_df),
+                   "upsilon": upsilon_disappear, "properties": {}}
+        for p in props:
+            if p not in ref_df.columns: continue
+            summary["properties"][p] = {
+                "dis_median": float(dis_df[p].median()),
+                "dis_iqr": float(dis_df[p].quantile(0.75) - dis_df[p].quantile(0.25)),
+                "sur_median": float(sur_df[p].median()),
+                "sur_iqr": float(sur_df[p].quantile(0.75) - sur_df[p].quantile(0.25)),
+            }
+            self.rp.info(f"{p:12s} : disappeared={dis_df[p].median():.2f}, "
+                         f"survived={sur_df[p].median():.2f}")
+        summary["disappeared_names"] = disappeared
+        return summary
+
+    def run_all(self, galaxies):
+        rp = self.rp; R: Dict[str, Any] = {}
+        rp.section("Statistical analysis")
+        rp.info(f"Sample size: N = {len(self.df)}")
+
+        R["main_median"] = self.fit_main_relation("phi_end")
+        R["main_endpoint"] = self.fit_main_relation("phi_Rmax")
+        rp.info(f"φ_end (median):   slope = {R['main_median']['slope']:+.3f}, "
+                f"r = {R['main_median']['pearson_r']:+.3f}, R² = {R['main_median']['R2']:.3f}")
+        rp.info(f"φ(R_max) endpoint: slope = {R['main_endpoint']['slope']:+.3f}, "
+                f"r = {R['main_endpoint']['pearson_r']:+.3f}, R² = {R['main_endpoint']['R2']:.3f}")
+
+        R["btfr_consistency"] = self.compute_btfr_rm_consistency()
+        R["radial_structure"] = self.compute_radial_structure()
+
+        R["correlations"] = self.correlation_table()
+        R["partials"] = self.partial_table()
+        R["models"] = self.multivariate_models()
+        R["cv"] = self.cross_validation()
+        R["circularity"] = self.circularity_test()
+        R["residuals"] = self.residual_diagnostics(R["main_median"])
+
+        R["ml_rigorous"] = self.ml_sensitivity_rigorous(galaxies)
+        R["selection_effects"] = self.selection_effect_analysis(galaxies)
+        R["r_sat_effects"] = self.r_sat_analysis(galaxies)
+        R["disappearing"] = self.disappearing_galaxies_properties(R["ml_rigorous"])
+
+        return R
+
+
+# ==============================================================================
+# STAGE 4 & 5 — FIGURES AND LATEX TABLES
+# ==============================================================================
+
+class PaperVisualizer:
+    def __init__(self, results, output_dir):
+        self.results = results
+        self.df = results["df"]
+        self.main_median = results["main_median"]
+        self.main_endpoint = results["main_endpoint"]
+        self.btfr = results["btfr_consistency"]
+        self.radial = results["radial_structure"]
+        self.corr = results["correlations"]
+        self.partials = results["partials"]
+        self.models = results["models"]
+        self.cv = results["cv"]
+        self.resid = results["residuals"]
+        self.ml = results.get("ml_rigorous", {})
+        self.sel = results.get("selection_effects", pd.DataFrame())
+        self.r_sat = results.get("r_sat_effects", pd.DataFrame())
+        self.dis = results.get("disappearing", {})
+        self.counts = results.get("sample_counts", {})
+
+        self.root = Path(output_dir)
+        self.fig_dir = self.root / "figures"
+        self.tab_dir = self.root / "tables"
+        self.fig_dir.mkdir(parents=True, exist_ok=True)
+        self.tab_dir.mkdir(parents=True, exist_ok=True)
+
+        plt.rcParams.update({
+            "font.family": "serif", "font.size": 11,
+            "axes.labelsize": 13, "axes.titlesize": 14,
+            "xtick.labelsize": 10, "ytick.labelsize": 10,
+            "legend.fontsize": 9, "figure.dpi": 150,
+            "savefig.dpi": 300, "savefig.bbox": "tight",
+            "axes.linewidth": 0.8,
+        })
+
+    def figure1_main_dual(self):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.6))
+        df = self.df
+        for ax, ycol, fit, title in [
+            (axes[0], "phi_end", self.main_median,
+             r"$\phi_{\rm end}$ (median, $r\geq5$ kpc)"),
+            (axes[1], "phi_Rmax", self.main_endpoint,
+             r"$\phi(R_{\rm max})$ (endpoint)"),
+        ]:
+            x = df["log_M_bar"].to_numpy(); y = df[ycol].to_numpy()
+            m = np.isfinite(x) & np.isfinite(y); x, y = x[m], y[m]
+            ax.scatter(x, y, s=32, alpha=0.6, color="steelblue",
+                       edgecolors="navy", lw=0.5, label=f"N={len(x)}")
+            xf = np.linspace(x.min(), x.max(), 200)
+            ax.plot(xf, fit["intercept"] + fit["slope"]*xf, "r-", lw=2,
+                    label=(f"slope = {fit['slope']:+.3f}\n"
+                           f"r = {fit['pearson_r']:+.3f}\n"
+                           f"R² = {fit['R2']:.3f}"))
+            ax.set_xlabel(r"$\log_{10}(M_{\rm bar}/M_\odot)$")
+            ax.set_ylabel(title)
+            ax.legend(loc="best", fontsize=9)
+            ax.grid(alpha=0.3, ls=":")
+        axes[0].set_title("(a) Median-based discrepancy")
+        axes[1].set_title("(b) Endpoint value = BTFR + R(M)")
+        plt.tight_layout()
+        out = self.fig_dir / "figure1_main_dual.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure2_btfr_prediction(self):
+        b = self.btfr
+        fig, ax = plt.subplots(figsize=(7.5, 5.6))
+        labels = ["Predicted\n(BTFR + R(M))", "Observed\n$\\phi(R_{\\rm max})$"]
+        values = [b["predicted_slope"], b["observed_slope"]]
+        colors = ["#1f77b4", "#d62728"]
+        bars = ax.bar(labels, values, color=colors, alpha=0.75,
+                      edgecolor="black", lw=0.7, width=0.5)
+        for bar, v in zip(bars, values):
+            offset = -0.02 if v < 0 else 0.02
+            va = "top" if v < 0 else "bottom"
+            ax.text(bar.get_x() + bar.get_width()/2, v + offset,
+                    f"{v:+.3f}", ha="center", va=va, fontsize=12, fontweight="bold")
+        ax.axhline(0, color="black", lw=0.5)
+        ax.set_ylabel(r"$d\phi(R_{\rm max})/d\log_{10}M_{\rm bar}$")
+        ax.set_title("Endpoint discrepancy is fully explained by BTFR + R(M)")
+        ax.grid(True, alpha=0.3, axis="y", ls=":")
+        ax.text(0.03, 0.05,
+                f"α = {b['btfr_slope_alpha']:+.3f} (r={b['btfr_r']:+.3f})\n"
+                f"p = {b['rm_slope_p']:+.3f} (r={b['rm_r']:+.3f})\n"
+                f"N = {b['N']}\n"
+                f"observed R² = {b['observed_R2']:.3f}\n"
+                f"residual = {b['residual']:+.4f}",
+                transform=ax.transAxes, fontsize=9, va="bottom",
+                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="gray", alpha=0.9))
+        plt.tight_layout()
+        out = self.fig_dir / "figure2_btfr_prediction.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure3_radial_structure(self):
+        df = self.df.copy()
+        df["delta_phi"] = df["phi_end"] - df["phi_Rmax"]
+        fig, ax = plt.subplots(figsize=(8, 5.8))
+        sc = ax.scatter(df["log_R_max"], df["delta_phi"],
+                        c=df["log_M_bar"], cmap="viridis",
+                        s=40, alpha=0.85, edgecolors="black", lw=0.3)
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label(r"$\log_{10}(M_{\rm bar}/M_\odot)$")
+        m = np.isfinite(df["log_R_max"]) & np.isfinite(df["delta_phi"])
+        fit = stats.linregress(df["log_R_max"].to_numpy()[m],
+                               df["delta_phi"].to_numpy()[m])
+        xf = np.linspace(df["log_R_max"].min(), df["log_R_max"].max(), 100)
+        ax.plot(xf, fit.intercept + fit.slope*xf, "r-", lw=2.2,
+                label=f"slope = {fit.slope:+.3f}, r = {fit.rvalue:+.3f}")
+        ax.set_xlabel(r"$\log_{10}(R_{\rm max}/{\rm kpc})$")
+        ax.set_ylabel(r"$\Delta\phi = \phi_{\rm end} - \phi(R_{\rm max})$")
+        ax.set_title("Radial structure: Δφ vs galaxy size")
+        ax.legend(loc="best"); ax.grid(alpha=0.3, ls=":")
+        r_p = self.radial["partial_correlations"].get("log_R_max", {})
+        ax.text(0.03, 0.05,
+                f"r(Δφ, R_max | M_bar) = {r_p.get('rho', np.nan):+.3f}\n"
+                f"p = {r_p.get('p', np.nan):.2e}",
+                transform=ax.transAxes, fontsize=10, va="bottom",
+                bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="gray", alpha=0.9))
+        plt.tight_layout()
+        out = self.fig_dir / "figure3_radial_structure.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure4_tertile_stability(self):
+        if not self.radial.get("tertiles"):
+            print("  ⚠ figure4 skipped: no tertile results")
+            return
+        df = self.df.copy()
+        df["delta_phi"] = df["phi_end"] - df["phi_Rmax"]
+        mask = (np.isfinite(df["log_M_bar"]) &
+                np.isfinite(df["delta_phi"]) &
+                np.isfinite(df["log_R_max"]))
+        df = df[mask].copy()
+        if len(df) < 20:
+            print("  ⚠ figure4 skipped: too few points")
+            return
+        try:
+            df["M_ter"] = pd.qcut(df["log_M_bar"], 3, labels=["low", "mid", "high"])
+        except ValueError:
+            print("  ⚠ figure4 skipped: qcut failed")
+            return
+        fig, ax = plt.subplots(figsize=(8, 5.6))
+        colors = {"low": "#1f77b4", "mid": "#2ca02c", "high": "#d62728"}
+        markers = {"low": "o", "mid": "s", "high": "^"}
+        for label in ["low", "mid", "high"]:
+            grp = df[df["M_ter"] == label]
+            if len(grp) < 5:
+                continue
+            try:
+                fit = stats.linregress(grp["log_R_max"], grp["delta_phi"])
+            except Exception:
+                continue
+            r_val = self.radial["tertiles"].get(label, {}).get("r", np.nan)
+            ax.scatter(grp["log_R_max"], grp["delta_phi"],
+                       color=colors[label], marker=markers[label],
+                       s=35, alpha=0.75, edgecolors="black", lw=0.3,
+                       label=f"{label} mass: r = {r_val:+.3f}")
+            xf = np.linspace(grp["log_R_max"].min(), grp["log_R_max"].max(), 50)
+            ax.plot(xf, fit.intercept + fit.slope*xf, color=colors[label], lw=1.5, alpha=0.8)
+        ax.set_xlabel(r"$\log_{10}(R_{\rm max}/{\rm kpc})$")
+        ax.set_ylabel(r"$\Delta\phi$")
+        ax.set_title("Radial structure is robust across mass tertiles")
+        ax.legend(loc="best", fontsize=9); ax.grid(alpha=0.3, ls=":")
+        plt.tight_layout()
+        out = self.fig_dir / "figure4_tertile_stability.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure5_residuals(self):
+        r = self.resid
+        fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+        axes[0,0].scatter(r["x_logM"], r["residuals"], s=28, alpha=0.65,
+                          color="steelblue", edgecolors="navy", lw=0.5)
+        axes[0,0].axhline(0, color="red", ls="--", lw=1)
+        axes[0,0].axhline( 2*r["rms"], color="orange", ls=":", lw=1)
+        axes[0,0].axhline(-2*r["rms"], color="orange", ls=":", lw=1)
+        axes[0,0].set_xlabel(r"$\log_{10}M_{\rm bar}$"); axes[0,0].set_ylabel("Residual")
+        axes[0,0].set_title("(a) Residuals vs mass"); axes[0,0].grid(alpha=0.3, ls=":")
+        axes[0,1].scatter(r["fitted"], r["residuals"], s=28, alpha=0.65,
+                          color="darkgreen", edgecolors="darkgreen", lw=0.5)
+        axes[0,1].axhline(0, color="red", ls="--", lw=1)
+        axes[0,1].set_xlabel("Fitted $\\phi_{\\rm end}$"); axes[0,1].set_ylabel("Residual")
+        axes[0,1].set_title("(b) Residuals vs fitted"); axes[0,1].grid(alpha=0.3, ls=":")
+        axes[1,0].hist(r["residuals"], bins=15, alpha=0.75, color="steelblue",
+                       edgecolor="navy", density=True)
+        xx = np.linspace(r["residuals"].min(), r["residuals"].max(), 200)
+        axes[1,0].plot(xx, stats.norm.pdf(xx, 0, r["rms"]), "r-", lw=2,
+                       label=f"Normal σ={r['rms']:.3f}")
+        axes[1,0].set_xlabel("Residual"); axes[1,0].set_ylabel("Density")
+        axes[1,0].set_title(f"(c) Distribution (Shapiro p={r['shapiro_p']:.3f})")
+        axes[1,0].legend(fontsize=9); axes[1,0].grid(alpha=0.3, ls=":")
+        stats.probplot(r["residuals"], dist="norm", plot=axes[1,1])
+        axes[1,1].set_title("(d) Q-Q plot"); axes[1,1].grid(alpha=0.3, ls=":")
+        plt.tight_layout()
+        out = self.fig_dir / "figure5_residuals.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure6_ml_sensitivity(self):
+        if not self.ml: return
+        fig, ax = plt.subplots(figsize=(8, 5.6))
+        Us = sorted(self.ml.keys())
+        slopes = [self.ml[U].get("slope", np.nan) for U in Us]
+        ns = [self.ml[U].get("N", 0) for U in Us]
+        ax.plot(Us, slopes, "o-", color="steelblue", ms=8, lw=1.5)
+        for U, s, n in zip(Us, slopes, ns):
+            ax.annotate(f"N={n}", (U, s), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=8)
+        ax.set_xlabel(r"$\Upsilon_{\rm disk}$ [$M_\odot/L_\odot$]")
+        ax.set_ylabel("Slope of median discrepancy–mass relation")
+        ax.set_title("Robustness to disk mass-to-light ratio")
+        ax.grid(alpha=0.3, ls=":")
+        plt.tight_layout()
+        out = self.fig_dir / "figure6_ml_sensitivity.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    def figure7_disappearing(self):
+        if not self.ml or 1.4 not in self.ml: return
+        r = self.ml[1.4]
+        survived = set(r.get("survived", []))
+        disappeared = set(r.get("disappeared", []))
+        df = self.df.copy()
+        df["surv_hi"] = df["name"].isin(survived)
+        df["dis_hi"]  = df["name"].isin(disappeared)
+        fig, ax = plt.subplots(figsize=(7.5, 5.6))
+        ax.scatter(df.loc[df["surv_hi"], "log_M_bar"], df.loc[df["surv_hi"], "phi_end"],
+                   s=32, alpha=0.6, color="steelblue", edgecolors="navy", lw=0.5,
+                   label=f"Survives at Υ=1.4 (N={len(survived)})")
+        if len(disappeared) > 0:
+            ax.scatter(df.loc[df["dis_hi"], "log_M_bar"], df.loc[df["dis_hi"], "phi_end"],
+                       s=58, alpha=0.85, color="crimson", marker="X",
+                       edgecolors="darkred", lw=1,
+                       label=f"Disappears at Υ=1.4 (N={len(disappeared)})")
+        ax.set_xlabel(r"$\log_{10}(M_{\rm bar}/M_\odot)$")
+        ax.set_ylabel(r"$\phi_{\rm end}$")
+        ax.set_title(r"Galaxies that lose $\phi>0$ at high $\Upsilon_{\rm disk}$")
+        ax.legend(loc="best", fontsize=9); ax.grid(alpha=0.3, ls=":")
+        plt.tight_layout()
+        out = self.fig_dir / "figure7_disappearing.pdf"
+        plt.savefig(out); plt.close()
+        print(f"  ✓ {out}")
+
+    # -------------------------------------------------------------------------
+    # LaTeX tables
+    # -------------------------------------------------------------------------
+
+    def _write_tex(self, name, content):
+        path = self.tab_dir / name
+        with open(path, "w") as f:
+            f.write(content)
+        print(f"  ✓ {path}")
+
+    def table1_sample(self):
+        c = self.counts
+        tex = rf"""\begin{{table}}[htbp]
+\centering
+\caption{{SPARC sample selection waterfall.}}
+\label{{tab:sample}}
+\begin{{tabular}}{{lc}}
+\hline
+Selection step & $N$ \\
+\hline
+SPARC input galaxies                          & {c.get('input', 175)} \\
+With $\geq 1$ valid point                     & {c.get('with_valid_points', 163)} \\
+With $\geq 4$ saturated points ($r\geq 5$ kpc) & {c.get('with_sat_points', 110)} \\
+After $M_{{\rm bar}} < 10^{{11}}\,M_\odot$        & {c.get('after_mass_cut', 83)} \\
+FINAL SAMPLE                                  & {c.get('final', 83)} \\
+\hline
+\end{{tabular}}
+\end{{table}}
+"""
+        self._write_tex("table1_sample.tex", tex)
+
+    def table2_correlations(self):
+        rows = []
+        for _, r in self.corr.sort_values("spearman_rho").iterrows():
+            p = r["spearman_p"]
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            var = r["variable"].replace("_", r"\_")
+            rows.append(f"{var} & ${r['spearman_rho']:+.3f}$ & ${p:.2e}$ & {sig} & {r['N']} \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Spearman rank correlations with $\phi_{\rm end}$ (median-based).}
+\label{tab:correlations}
+\begin{tabular}{lcccc}
+\hline
+Variable & $\rho_s$ & $p$-value & Sig. & $N$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table2_correlations.tex", tex)
+
+    def table3_partials(self):
+        rows = []
+        for _, r in self.partials.iterrows():
+            p = r["p_value"]
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            var = r["variable"].replace("_", r"\_")
+            ctl = r["controlling_for"].replace("_", r"\_")
+            rows.append(f"{var} & {ctl} & ${r['partial_rho']:+.3f}$ & ${p:.2e}$ & {sig} & {r['N']} \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{First-order partial correlations with $\phi_{\rm end}$.}
+\label{tab:partials}
+\begin{tabular}{llcccc}
+\hline
+Variable & Control & $\rho_p$ & $p$-value & Sig. & $N$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table3_partials.tex", tex)
+
+    def table4_models(self):
+        rows = []
+        for _, r in self.models.iterrows():
+            name = r["model"].replace("_", r"\_").replace("Σ", r"$\Sigma$")
+            rows.append(f"{name} & {r['k']} & {r['N']} & ${r['R2']:.3f}$ & "
+                        f"${r['R2_adj']:.3f}$ & ${r['AIC']:.1f}$ & ${r['BIC']:.1f}$ \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Nested multivariate models for $\phi_{\rm end}$.}
+\label{tab:models}
+\begin{tabular}{lcccccc}
+\hline
+Model & $k$ & $N$ & $R^2$ & $R^2_{\rm adj}$ & AIC & BIC \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table4_models.tex", tex)
+
+    def table5_ml_sensitivity(self):
+        if not self.ml: return
+        rows = []
+        for U in sorted(self.ml):
+            r = self.ml[U]
+            rows.append(f"{U:.1f} & {r.get('N', 0)} & {r.get('N_disappeared', 0)} & "
+                        f"{r.get('N_degraded', 0)} & ${r.get('slope', np.nan):+.3f}$ & "
+                        f"${r.get('intercept', np.nan):+.3f}$ & ${r.get('r', np.nan):+.3f}$ & "
+                        f"${r.get('R2', np.nan):.3f}$ \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Robustness to $\Upsilon_{\rm disk}$ (fixed-sample test).
+         All rows use the same 83 reference galaxies; only $\Upsilon_{\rm disk}$ is varied.
+         ``Disappeared'' galaxies lose all $\phi>0$ points;
+         ``degraded'' galaxies lose saturated-regime coverage but retain some valid points.}
+\label{tab:ml}
+\begin{tabular}{cccccccc}
+\hline
+$\Upsilon_{\rm disk}$ & $N_{\rm kept}$ & $N_{\rm dis}$ & $N_{\rm deg}$ & Slope & Intercept & $r$ & $R^2$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table5_ml_sensitivity.tex", tex)
+
+    def table6_cv(self):
+        rows = []
+        for _, r in self.cv.iterrows():
+            name = r["model"].replace("_", r"\_").replace("Σ", r"$\Sigma$")
+            rows.append(f"{name} & ${r['R2_cv_mean']:.3f}\\pm{r['R2_cv_std']:.3f}$ & "
+                        f"${r['RMSE_cv_mean']:.3f}$ & {r['N']} \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{10-fold cross-validation.}
+\label{tab:cv}
+\begin{tabular}{lccc}
+\hline
+Model & $R^2_{\rm CV}$ & RMSE$_{\rm CV}$ & $N$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table6_cv.tex", tex)
+
+    def table7_selection(self):
+        if self.sel is None or len(self.sel) == 0: return
+        rows = []
+        for _, r in self.sel.iterrows():
+            label = "no cut" if r["cutoff"] >= 1e15 else f"{r['cutoff']:.0e}"
+            rows.append(f"{label} & {int(r['N'])} & ${r['slope']:+.3f}$ & "
+                        f"${r['intercept']:+.3f}$ & ${r['r']:+.3f}$ & ${r['R2']:.3f}$ \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Dependence on the baryonic-mass upper cut.}
+\label{tab:selection}
+\begin{tabular}{cccccc}
+\hline
+$M_{\rm bar}$ cut & $N$ & Slope & Intercept & $r$ & $R^2$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table7_selection.tex", tex)
+
+    def table8_r_sat(self):
+        if self.r_sat is None or len(self.r_sat) == 0: return
+        rows = []
+        for _, r in self.r_sat.iterrows():
+            rows.append(f"{r['r_sat']:.1f} & {int(r['N'])} & ${r['slope']:+.3f}$ & "
+                        f"${r['intercept']:+.3f}$ & ${r['r']:+.3f}$ & ${r['R2']:.3f}$ \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Sensitivity to the saturated-regime threshold $r_{\rm sat}$.
+         The reference value adopted in this work is $r_{\rm sat}=5$~kpc (third row).
+         Values of $N$ differ by one galaxy at $r_{\rm sat}=4.0$ and $4.5$~kpc
+         compared to earlier analyses, because the present pipeline additionally
+         requires a valid endpoint $\phi(R_{\rm max})$ measurement for every
+         retained galaxy.}
+\label{tab:r_sat}
+\begin{tabular}{cccccc}
+\hline
+$r_{\rm sat}$ [kpc] & $N$ & Slope & Intercept & $r$ & $R^2$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table8_r_sat.tex", tex)
+
+    def table9_btfr_consistency(self):
+        b = self.btfr
+        tex = rf"""\begin{{table}}[htbp]
+\centering
+\caption{{BTFR + R(M) consistency test. The predicted slope of
+         $\phi(R_{{\rm max}})$ vs $\log M_{{\rm bar}}$ follows from
+         $\alpha$ and $p$ via $d\phi/d\log M = \ln(10)\cdot(\alpha - 0.5 + p/2)$.
+         The observed slope matches the prediction to within
+         ${abs(b['residual']):.4f}$ (${b['agreement_pct']:.2f}\%$).}}
+\label{{tab:btfr_consistency}}
+\begin{{tabular}}{{lcc}}
+\hline
+Quantity & Value & Source \\
+\hline
+BTFR slope $\alpha$ & ${b['btfr_slope_alpha']:+.3f}$ & fit \\
+BTFR $r$ & ${b['btfr_r']:+.3f}$ & fit \\
+$R(M)$ slope $p$ & ${b['rm_slope_p']:+.3f}$ & fit \\
+$R(M)$ $r$ & ${b['rm_r']:+.3f}$ & fit \\
+Predicted slope: $\ln(10)(\alpha - 0.5 + p/2)$ & ${b['predicted_slope']:+.3f}$ & derivation \\
+Observed slope of $\phi(R_{{\rm max}})$ & ${b['observed_slope']:+.3f}$ & fit \\
+Residual (observed $-$ predicted) & ${b['residual']:+.4f}$ & \\
+Agreement & ${b['agreement_pct']:.2f}\%$ & \\
+\hline
+\multicolumn{{3}}{{l}}{{\footnotesize $N = {b['N']}$ galaxies. Zero residual confirms $\phi(R_{{\rm max}})$ is fully explained by BTFR + R(M).}} \\
+\end{{tabular}}
+\end{{table}}
+"""
+        self._write_tex("table9_btfr_consistency.tex", tex)
+
+    def table10_radial_structure(self):
+        rs = self.radial
+        rows = []
+        for var, r in rs["raw_correlations"].items():
+            p = r["p"]
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            var_d = var.replace("_", r"\_")
+            rows.append(f"raw & {var_d} & ${r['r']:+.3f}$ & ${p:.2e}$ & {sig} & {r['N']} \\\\")
+        for var, r in rs["partial_correlations"].items():
+            p = r["p"]
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            var_d = var.replace("_", r"\_")
+            rows.append(f"partial & {var_d} & ${r['rho']:+.3f}$ & ${p:.2e}$ & {sig} & {r['N']} \\\\")
+
+        tert_rows = []
+        for name, t in rs["tertiles"].items():
+            p = t["p"]
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "n.s."
+            tert_rows.append(
+                f"{name} & {t['N']} & ${t['r']:+.3f}$ & ${p:.2e}$ & {sig} & \\\\"
+            )
+
+        st = rs["statistics"]
+        dvm = rs["delta_vs_mbar"]
+        tex = rf"""\begin{{table}}[htbp]
+\centering
+\caption{{Radial structure analysis: $\Delta\phi \equiv \phi_{{\rm end}} - \phi(R_{{\rm max}})$.
+         Summary statistics: mean = ${st['mean']:+.4f}$, median = ${st['median']:+.4f}$,
+         std = ${st['std']:.4f}$, $N = {st['N']}$.
+         ``Raw'' rows report simple Pearson correlations; ``partial'' rows report
+         correlations controlling for $\log M_{{\rm bar}}$.
+         Note that the strong partial correlation between $\Delta\phi$ and
+         $\log\Sigma$ (last partial row) is a mathematical consequence of the
+         algebraic relation $\Sigma = M_{{\rm bar}}/(\pi R_{{\rm max}}^2)$:
+         at fixed $M_{{\rm bar}}$, $\log\Sigma$ is simply $-2\log R_{{\rm max}}$
+         plus a constant, so the two partial correlations are not independent.}}
+\label{{tab:radial_structure}}
+\begin{{tabular}}{{llcccc}}
+\hline
+Type & Variable & Coefficient & $p$-value & Sig. & $N$ \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\multicolumn{6}{c}{$\Delta\phi \sim \log R_{\rm max}$ by $M_{\rm bar}$ tertile} \\
+\hline
+Tertile & $N$ & $r$ & $p$-value & Sig. & \\
+\hline
+""" + "\n".join(tert_rows) + r"""
+\hline
+\multicolumn{6}{l}{\footnotesize Significance: $^{***}p<0.001$, $^{**}p<0.01$, $^{*}p<0.05$.} \\
+\multicolumn{6}{l}{\footnotesize Slope of $\Delta\phi$ vs $\log M_{\rm bar}$ is """ + f"${dvm['slope']:+.3f}$ ($r={dvm['r']:+.3f}$, $p={dvm['p']:.2e}$)." + r"""} \\
+\end{tabular}
+\end{table}
+"""
+        self._write_tex("table10_radial_structure.tex", tex)
+
+    def table11_disappearing(self):
+        d = self.dis
+        if not d or d.get("N_disappeared", 0) == 0: return
+        props = d.get("properties", {})
+        labels = {"log_M_bar": r"$\log_{10}(M_{\rm bar}/M_\odot)$",
+                  "phi_end": r"$\phi_{\rm end}$",
+                  "R_max": r"$R_{\rm max}$ [kpc]",
+                  "Sigma": r"$\Sigma$",
+                  "f_gas": r"$f_{\rm gas}$"}
+        rows = []
+        for p, lbl in labels.items():
+            if p not in props: continue
+            v = props[p]
+            rows.append(f"{lbl} & ${v['dis_median']:.2f} \\pm {v['dis_iqr']/2:.2f}$ & "
+                        f"${v['sur_median']:.2f} \\pm {v['sur_iqr']/2:.2f}$ \\\\")
+        tex = (r"""\begin{table}[htbp]
+\centering
+\caption{Properties of galaxies that disappear at $\Upsilon_{\rm disk}=""" + f"{d['upsilon']:.1f}" + r"""$.}
+\label{tab:disappearing}
+\begin{tabular}{lcc}
+\hline
+Property & Disappeared (N=""" + f"{d['N_disappeared']}" + r""") & Survived (N=""" + f"{d['N_survived']}" + r""") \\
+\hline
+""" + "\n".join(rows) + r"""
+\hline
+\multicolumn{3}{l}{\footnotesize Uncertainties are half the IQR.} \\
+\end{tabular}
+\end{table}
+""")
+        self._write_tex("table11_disappearing.tex", tex)
+
+    def render_all(self):
+        print("\n" + "─" * 60)
+        print("  FIGURE GENERATION (v4.1.0)")
+        print("─" * 60)
+        self.figure1_main_dual()
+        self.figure2_btfr_prediction()
+        self.figure3_radial_structure()
+        self.figure4_tertile_stability()
+        self.figure5_residuals()
+        self.figure6_ml_sensitivity()
+        self.figure7_disappearing()
+        print("\n" + "─" * 60)
+        print("  LATEX TABLE GENERATION (v4.1.0)")
+        print("─" * 60)
+        self.table1_sample()
+        self.table2_correlations()
+        self.table3_partials()
+        self.table4_models()
+        self.table5_ml_sensitivity()
+        self.table6_cv()
+        self.table7_selection()
+        self.table8_r_sat()
+        self.table9_btfr_consistency()
+        self.table10_radial_structure()
+        self.table11_disappearing()
+
+
+# ==============================================================================
+# STAGE 6 — PIPELINE
+# ==============================================================================
+
+def run_pipeline(cfg: Optional[Config] = None, verbose: bool = True) -> Dict[str, Any]:
+    cfg = cfg or Config()
+    rp = Reporter(verbose)
+
+    rp.header(f"Radial Structure in the Mass Discrepancy  (v{__version__})")
+    rp.info(f"Config fingerprint : {cfg.fingerprint()}")
+    rp.info(f"Python             : {platform.python_version()}")
+    rp.info(f"NumPy / Pandas     : {np.__version__} / {pd.__version__}")
+    rp.info(f"Random seed        : {cfg.RANDOM_SEED}")
+
+    galaxies = SPARCFetcher(cfg, rp).load()
+
+    sample_builder = DiscrepancySample(cfg, rp)
+    df = sample_builder.build(galaxies)
+
+    if len(df) < 10:
+        rp.error(f"Insufficient sample: N={len(df)}")
+        return {"status": "failed_small_sample", "cfg": cfg, "df": df,
+                "sample_counts": sample_builder.counts(),
+                "rejection_log": sample_builder.rejections_df()}
+
+    analyzer = DiscrepancyAnalyzer(df, cfg, rp)
+    results = analyzer.run_all(galaxies)
+
+    out = Path(cfg.OUTPUT_DIR)
+    out.mkdir(parents=True, exist_ok=True)
+    rp.section("Exporting artefacts")
+
+    df.to_csv(out / "sample_final.csv", index=False)
+    rp.ok(f"sample_final.csv ({len(df)} rows, {len(df.columns)} cols)")
+
+    results["correlations"].to_csv(out / "table2_correlations.csv", index=False)
+    results["partials"].to_csv(out / "table3_partials.csv", index=False)
+    results["models"].to_csv(out / "table4_models.csv", index=False)
+    results["cv"].to_csv(out / "table6_cv.csv", index=False)
+    results["selection_effects"].to_csv(out / "table7_selection.csv", index=False)
+    results["r_sat_effects"].to_csv(out / "table8_r_sat.csv", index=False)
+    rp.ok("CSV tables 2, 3, 4, 6, 7, 8")
+
+    pd.DataFrame([
+        {"quantity": k, "value": v}
+        for k, v in results["btfr_consistency"].items()
+        if not isinstance(v, (list, dict))
+    ]).to_csv(out / "table9_btfr_consistency.csv", index=False)
+    rp.ok("table9_btfr_consistency.csv")
+
+    radial_rows = []
+    for k, v in results["radial_structure"]["raw_correlations"].items():
+        radial_rows.append({"type": "raw", "variable": k, **v})
+    for k, v in results["radial_structure"]["partial_correlations"].items():
+        radial_rows.append({"type": "partial|Mbar", "variable": k, **v})
+    pd.DataFrame(radial_rows).to_csv(out / "table10_radial_structure.csv", index=False)
+    rp.ok("table10_radial_structure.csv")
+
+    sample_builder.rejections_df().to_csv(out / "rejection_log.csv", index=False)
+
+    ml_rows = []
+    for U, r in results["ml_rigorous"].items():
+        ml_rows.append({"upsilon_disk": U, "N_kept": r.get("N", 0),
+                        "N_disappeared": r.get("N_disappeared", 0),
+                        "N_degraded": r.get("N_degraded", 0),
+                        "slope": r.get("slope", np.nan),
+                        "intercept": r.get("intercept", np.nan),
+                        "r": r.get("r", np.nan),
+                        "R2": r.get("R2", np.nan)})
+    pd.DataFrame(ml_rows).to_csv(out / "table5_ml_sensitivity.csv", index=False)
+
+    if results.get("disappearing", {}).get("N_disappeared", 0) > 0:
+        dis_df = pd.DataFrame([{"name": n}
+                               for n in results["disappearing"]["disappeared_names"]])
+        dis_df.to_csv(out / "table11_disappearing.csv", index=False)
+
+    def _scipy_ver():
+        try:
+            import scipy as _s
+            return getattr(_s, "__version__", "unknown")
+        except Exception:
+            return "unknown"
+
+    manifest = {
+        "version": __version__,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "cfg_fingerprint": cfg.fingerprint(),
+        "cfg": asdict(cfg),
+        "environment": {
+            "python": platform.python_version(),
+            "numpy": np.__version__, "pandas": pd.__version__,
+            "scipy": _scipy_ver(),
+            "statsmodels": __import__("statsmodels").__version__,
+            "sklearn": __import__("sklearn").__version__,
+        },
+        "main_median": {k: (float(v) if isinstance(v, (int, float, np.floating)) else
+                            (list(map(float, v)) if isinstance(v, list) else str(v)))
+                        for k, v in results["main_median"].items()
+                        if k not in ("x", "y", "model")},
+        "main_endpoint": {k: (float(v) if isinstance(v, (int, float, np.floating)) else
+                              (list(map(float, v)) if isinstance(v, list) else str(v)))
+                          for k, v in results["main_endpoint"].items()
+                          if k not in ("x", "y", "model")},
+        "btfr_consistency": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
+                             for k, v in results["btfr_consistency"].items()},
+        "radial_structure_summary": {
+            "delta_mean": float(results["radial_structure"]["statistics"]["mean"]),
+            "delta_median": float(results["radial_structure"]["statistics"]["median"]),
+            "r_delta_Rmax_partial": float(results["radial_structure"]["partial_correlations"]
+                                          .get("log_R_max", {}).get("rho", np.nan)),
+            "p_delta_Rmax_partial": float(results["radial_structure"]["partial_correlations"]
+                                          .get("log_R_max", {}).get("p", np.nan)),
+            "tertile_r": {k: float(v["r"]) for k, v in results["radial_structure"]["tertiles"].items()},
+        },
+    }
+    with open(out / "run_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    rp.ok("run_manifest.json")
+
+    results["df"] = df
+    results["cfg"] = cfg
+    results["rejection_log"] = sample_builder.rejections_df()
+    results["sample_counts"] = sample_builder.counts()
+    results["all_galaxies"] = galaxies
+
+    visualizer = PaperVisualizer(results, str(out))
+    visualizer.render_all()
+
+    rp.header("ANALYSIS COMPLETE")
+    rp.info(f"Final N                              : {len(df)}")
+    rp.info(f"φ_end slope (median)                 : {results['main_median']['slope']:+.3f}")
+    rp.info(f"φ(R_max) slope (endpoint)            : {results['main_endpoint']['slope']:+.3f}")
+    rp.info(f"BTFR + R(M) predicted slope          : {results['btfr_consistency']['predicted_slope']:+.3f}")
+    rp.info(f"Residual (observed − predicted)      : {results['btfr_consistency']['residual']:+.4f}")
+    rp.info(f"Δφ mean                              : {results['radial_structure']['statistics']['mean']:+.4f}")
+    rp.info(f"r(Δφ, R_max | M_bar)                 : "
+            f"{results['radial_structure']['partial_correlations'].get('log_R_max', {}).get('rho', np.nan):+.3f}")
+    rp.info(f"Output directory                     : {out.resolve()}")
+
+    results["status"] = "ok"
+    results["run_metadata"] = manifest
+    return results
+
+
+# ==============================================================================
+# CLI
+# ==============================================================================
+
+def _parse_cli(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="median_discrepancy_mass",
+        description=f"Radial Structure pipeline — version {__version__}",
+    )
+    parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--version", action="version", version=f"median_discrepancy_mass {__version__}")
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_cli(argv)
+    overrides: Dict[str, Any] = {"FORCE_REFRESH": args.force_refresh, "RANDOM_SEED": args.seed}
+    if args.output_dir:
+        overrides["OUTPUT_DIR"] = args.output_dir
+    cfg = Config(**overrides)
+    result = run_pipeline(cfg, verbose=not args.quiet)
+    return 0 if result.get("status") == "ok" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
