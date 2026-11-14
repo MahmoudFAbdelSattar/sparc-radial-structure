@@ -1,0 +1,39 @@
+\begin{table}[htbp]
+\centering
+\caption{Radial structure analysis: $\Delta\phi \equiv \phi_{\rm end} - \phi(R_{\rm max})$.
+         Summary statistics: mean = $-0.1026$, median = $-0.0915$,
+         std = $0.1169$, $N = 83$.
+         ``Raw'' rows report simple Pearson correlations; ``partial'' rows report
+         correlations controlling for $\log M_{\rm bar}$.
+         Note that the strong partial correlation between $\Delta\phi$ and
+         $\log\Sigma$ (last partial row) is a mathematical consequence of the
+         algebraic relation $\Sigma = M_{\rm bar}/(\pi R_{\rm max}^2)$:
+         at fixed $M_{\rm bar}$, $\log\Sigma$ is simply $-2\log R_{\rm max}$
+         plus a constant, so the two partial correlations are not independent.}
+\label{tab:radial_structure}
+\begin{tabular}{llcccc}
+\hline
+Type & Variable & Coefficient & $p$-value & Sig. & $N$ \\
+\hline
+raw & log\_R\_max & $-0.550$ & $7.26e-08$ & *** & 83 \\
+raw & log\_M\_bar & $-0.397$ & $1.99e-04$ & *** & 83 \\
+raw & log\_M\_disk & $-0.408$ & $1.29e-04$ & *** & 83 \\
+raw & log\_M\_gas & $-0.188$ & $8.92e-02$ & n.s. & 83 \\
+raw & log\_Sigma & $+0.042$ & $7.07e-01$ & n.s. & 83 \\
+raw & f\_gas & $+0.401$ & $1.74e-04$ & *** & 83 \\
+partial & log\_R\_max & $-0.419$ & $8.77e-05$ & *** & 83 \\
+partial & f\_gas & $+0.182$ & $1.01e-01$ & n.s. & 83 \\
+partial & log\_Sigma & $+0.419$ & $8.77e-05$ & *** & 83 \\
+\hline
+\multicolumn{6}{c}{$\Delta\phi \sim \log R_{\rm max}$ by $M_{\rm bar}$ tertile} \\
+\hline
+Tertile & $N$ & $r$ & $p$-value & Sig. & \\
+\hline
+low & 28 & $-0.574$ & $1.40e-03$ & ** & \\
+mid & 27 & $-0.375$ & $5.42e-02$ & n.s. & \\
+high & 28 & $-0.455$ & $1.51e-02$ & * & \\
+\hline
+\multicolumn{6}{l}{\footnotesize Significance: $^{***}p<0.001$, $^{**}p<0.01$, $^{*}p<0.05$.} \\
+\multicolumn{6}{l}{\footnotesize Slope of $\Delta\phi$ vs $\log M_{\rm bar}$ is $-0.080$ ($r=-0.397$, $p=1.99e-04$).} \\
+\end{tabular}
+\end{table}
